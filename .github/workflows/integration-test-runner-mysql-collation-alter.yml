@@ -1,0 +1,398 @@
+name: Integration Test Runner - MySQL Collation ALTER
+on:
+  workflow_dispatch:
+    inputs:
+      pack_url:
+        description: "URL to a pre-built WSO2 IS zip pack (optional). If omitted, a pack is built from source."
+        default:
+        required: false
+
+env:
+  MAVEN_OPTS: -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.http.retryHandler.class=standard -Dmaven.wagon.http.retryHandler.count=3 -Djdk.util.zip.disableZip64ExtraFieldValidation=true -XX:+HeapDumpOnOutOfMemoryError
+  DB_PASSWORD: "Test@1234wso2IS"
+  WSO2_IDENTITY_DB: "WSO2IDENTITY_DB"
+  WSO2_SHARED_DB: "WSO2SHARED_DB"
+  WSO2_AGENT_IDENTITY_DB: "WSO2AGENTIDENTITY_DB"
+  MYSQL_JDBC_VERSION: "8.0.33"
+
+jobs:
+  run-test-runners:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner_id: 1
+            tests: "is-tests-default-configuration,is-test-rest-api,is-test-webhooks,is-tests-scim2,is-test-adaptive-authentication"
+          - runner_id: 2
+            tests: "is-test-adaptive-authentication-nashorn,is-test-adaptive-authentication-nashorn-with-restart,is-tests-default-configuration-ldap,is-tests-uuid-user-store,is-tests-federation,is-tests-federation-restart"
+          - runner_id: 3
+            tests: "is-tests-jdbc-userstore,is-tests-read-only-userstore,is-tests-oauth-jwt-token-gen-enabled,is-tests-email-username,is-tests-saml-query-profile,is-tests-default-encryption,is-test-session-mgt,is-tests-password-update-api"
+          - runner_id: 4
+            tests: "is-tests-with-individual-configuration-changes"
+
+    steps:
+      - name: Print Input
+        run: echo "Running MySQL Collation ALTER Test Runner ${{ matrix.runner_id }}"
+
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Echo java 21 home
+        id: java-21-setup
+        run: echo "J21HOME=$JAVA_HOME" >> ${GITHUB_ENV}
+
+      - name: Build init
+        run: echo "CURRENT_MONTH=$(date +%Y-%m)" >> ${GITHUB_ENV}
+
+      - name: Cache maven packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2
+            !~/.m2/repository/org/wso2/is/wso2is
+          key: ${{ runner.os }}-mysql-collation-runner-${{ env.CURRENT_MONTH }}-${{ matrix.runner_id }}
+
+      # ── MySQL setup (runs early so DB issues surface before the long build) ──
+
+      - name: Start MySQL
+        run: |
+          docker run -d --name mysql \
+            -e MYSQL_ROOT_PASSWORD="$DB_PASSWORD" \
+            -p 3306:3306 \
+            mysql:8.0
+
+      - name: Install MySQL client
+        run: sudo apt-get install -y mysql-client
+
+      - name: Wait for MySQL and create databases
+        run: |
+          echo "Waiting for MySQL to be ready..."
+          MYSQL_READY=false
+          for i in $(seq 1 30); do
+            if mysqladmin ping -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" --silent 2>/dev/null; then
+              MYSQL_READY=true
+              break
+            fi
+            echo "Attempt $i: not ready, retrying in 5 seconds..."
+            sleep 5
+          done
+          if [ "$MYSQL_READY" != "true" ]; then
+            echo "ERROR: MySQL did not become ready after 30 attempts."
+            docker logs mysql || true
+            exit 1
+          fi
+          mysql -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" -e "CREATE DATABASE \`$WSO2_IDENTITY_DB\` CHARACTER SET latin1;"
+          mysql -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" -e "CREATE DATABASE \`$WSO2_SHARED_DB\` CHARACTER SET latin1;"
+          mysql -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" -e "CREATE DATABASE \`$WSO2_AGENT_IDENTITY_DB\` CHARACTER SET latin1;"
+          echo "Databases created successfully."
+
+      # ── Build / locate IS distribution ───────────────────────────────────────
+
+      - name: Build product-IS without integration tests
+        if: ${{ github.event.inputs.pack_url == '' }}
+        env:
+          JAVA_HOME: ${{ env.J21HOME }}
+        run: mvn clean install --batch-mode -Dmaven.test.skip=true | tee mvn-build.log
+
+      - name: Replace IS pack with provided pack
+        if: ${{ github.event.inputs.pack_url != '' }}
+        run: |
+          IS_DIST_DIR="modules/distribution/target"
+          mkdir -p "$IS_DIST_DIR"
+          wget -q "${{ github.event.inputs.pack_url }}" -O /tmp/wso2is-pack.zip
+          unzip -q /tmp/wso2is-pack.zip -d "$IS_DIST_DIR/"
+
+      - name: Locate IS distribution directory
+        run: |
+          IS_DIST_DIR="modules/distribution/target"
+          IS_DIST=$(find "$IS_DIST_DIR" -maxdepth 1 -type d -name "wso2is-*" | head -1)
+          if [ -z "$IS_DIST" ]; then
+            echo "No extracted directory found — unzipping distribution..."
+            IS_ZIP=$(find "$IS_DIST_DIR" -maxdepth 1 -name "wso2is-*.zip" ! -name "*-src.zip" | head -1)
+            if [ -z "$IS_ZIP" ]; then
+              echo "ERROR: No wso2is-*.zip found in $IS_DIST_DIR"
+              ls -la "$IS_DIST_DIR" || true
+              exit 1
+            fi
+            unzip -q "$IS_ZIP" -d "$IS_DIST_DIR/"
+            IS_DIST=$(find "$IS_DIST_DIR" -maxdepth 1 -type d -name "wso2is-*" | head -1)
+          fi
+          if [ -z "$IS_DIST" ]; then
+            echo "ERROR: Could not locate IS distribution directory after extraction"
+            ls -la "$IS_DIST_DIR" || true
+            exit 1
+          fi
+          echo "IS_DIST=$IS_DIST" >> $GITHUB_ENV
+          echo "IS distribution located at: $IS_DIST"
+
+      # ── Schema scripts + collation ALTERs ────────────────────────────────────
+
+      - name: Run MySQL schema scripts
+        run: |
+          mysql -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" "$WSO2_SHARED_DB" < "$IS_DIST/dbscripts/mysql.sql"
+          mysql -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" "$WSO2_IDENTITY_DB" < "$IS_DIST/dbscripts/identity/mysql.sql"
+          mysql -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" "$WSO2_AGENT_IDENTITY_DB" < "$IS_DIST/dbscripts/identity/agent/mysql.sql"
+          mysql -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" "$WSO2_IDENTITY_DB" < "$IS_DIST/dbscripts/consent/mysql.sql"
+          echo "All schema scripts executed successfully."
+
+      - name: Apply collation ALTERs to shared_db
+        run: |
+          echo "Applying collation ALTERs to $WSO2_SHARED_DB..."
+          mysql -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" "$WSO2_SHARED_DB" << 'SQL'
+          ALTER TABLE UM_ACCOUNT_MAPPING MODIFY COLUMN UM_USER_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE UM_HYBRID_REMEMBER_ME MODIFY COLUMN UM_USER_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE UM_HYBRID_USER_ROLE MODIFY COLUMN UM_USER_NAME VARCHAR(255) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE UM_SYSTEM_USER MODIFY COLUMN UM_USER_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE UM_SYSTEM_USER_ROLE MODIFY COLUMN UM_USER_NAME VARCHAR(255) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE UM_USER MODIFY COLUMN UM_USER_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE UM_USER_ATTRIBUTE MODIFY COLUMN UM_ATTR_VALUE VARCHAR(512) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE UM_USER_PERMISSION MODIFY COLUMN UM_USER_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          SQL
+          echo "shared_db collation ALTERs applied successfully."
+
+      - name: Apply collation ALTERs to identity_db
+        run: |
+          echo "Applying collation ALTERs to $WSO2_IDENTITY_DB..."
+          mysql -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" "$WSO2_IDENTITY_DB" << 'SQL'
+          ALTER TABLE FIDO_DEVICE_STORE MODIFY COLUMN USER_NAME VARCHAR(45) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE FIDO2_DEVICE_STORE MODIFY COLUMN USER_NAME VARCHAR(45) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_ASSOCIATED_ID MODIFY COLUMN USER_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_AUTH_SESSION_APP_INFO MODIFY COLUMN SUBJECT VARCHAR(100) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_AUTH_USER MODIFY COLUMN USER_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_IDENTITY_META_DATA MODIFY COLUMN USER_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_IDENTITY_USER_DATA MODIFY COLUMN USER_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_OAUTH_CONSUMER_APPS MODIFY COLUMN USERNAME VARCHAR(255) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_OAUTH1A_ACCESS_TOKEN MODIFY COLUMN AUTHZ_USER VARCHAR(512) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_OAUTH1A_REQUEST_TOKEN MODIFY COLUMN AUTHORIZED VARCHAR(128) COLLATE utf8mb4_0900_ai_ci, MODIFY COLUMN AUTHZ_USER VARCHAR(512) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_OAUTH2_ACCESS_TOKEN MODIFY COLUMN AUTHZ_USER VARCHAR(100) COLLATE utf8mb4_0900_ai_ci, MODIFY COLUMN SUBJECT_IDENTIFIER VARCHAR(255) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_OAUTH2_ACCESS_TOKEN_AUDIT MODIFY COLUMN AUTHZ_USER VARCHAR(100) COLLATE utf8mb4_0900_ai_ci, MODIFY COLUMN SUBJECT_IDENTIFIER VARCHAR(255) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_OAUTH2_AUTHORIZATION_CODE MODIFY COLUMN AUTHZ_USER VARCHAR(100) COLLATE utf8mb4_0900_ai_ci, MODIFY COLUMN SUBJECT_IDENTIFIER VARCHAR(255) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_OAUTH2_CIBA_AUTH_CODE MODIFY COLUMN AUTHENTICATED_USER_NAME VARCHAR(255) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_OAUTH2_DEVICE_FLOW MODIFY COLUMN AUTHZ_USER VARCHAR(100) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_OIDC_REQ_OBJ_CLAIM_VALUES MODIFY COLUMN CLAIM_VALUES VARCHAR(255) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_OIDC_REQ_OBJECT_CLAIMS MODIFY COLUMN VALUE VARCHAR(255) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_OPENID_REMEMBER_ME MODIFY COLUMN USER_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_OPENID_USER_RPS MODIFY COLUMN USER_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_PASSWORD_HISTORY_DATA MODIFY COLUMN USER_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDP_PROVISIONING_ENTITY MODIFY COLUMN ENTITY_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_RECOVERY_DATA MODIFY COLUMN USER_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_SAML2_ASSERTION_STORE MODIFY COLUMN SAML2_SUBJECT VARCHAR(255) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_THRIFT_SESSION MODIFY COLUMN USER_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE IDN_USER_ACCOUNT_ASSOCIATION MODIFY COLUMN USER_NAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE SP_APP MODIFY COLUMN USERNAME VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE WF_REQUEST MODIFY COLUMN CREATED_BY VARCHAR(255) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE WF_REQUEST_ENTITY_RELATIONSHIP MODIFY COLUMN ENTITY_NAME VARCHAR(255) COLLATE utf8mb4_0900_ai_ci;
+          ALTER TABLE CM_RECEIPT MODIFY COLUMN PII_PRINCIPAL_ID VARCHAR(255) NOT NULL COLLATE utf8mb4_0900_ai_ci;
+          SQL
+          echo "identity_db collation ALTERs applied successfully."
+
+      - name: Validate collation changes on shared_db
+        run: |
+          EXPECTED_SHARED=8
+          ACTUAL_SHARED=$(mysql -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" -N -e "
+            SELECT COUNT(*)
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = '$WSO2_SHARED_DB'
+              AND COLLATION_NAME = 'utf8mb4_0900_ai_ci';
+          ")
+          echo "shared_db — expected: $EXPECTED_SHARED altered columns, actual: $ACTUAL_SHARED"
+          mysql -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" "$WSO2_SHARED_DB" -e "
+            SELECT TABLE_NAME, COLUMN_NAME, COLLATION_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = '$WSO2_SHARED_DB'
+              AND COLLATION_NAME = 'utf8mb4_0900_ai_ci'
+            ORDER BY TABLE_NAME, COLUMN_NAME;
+          "
+          if [ "$ACTUAL_SHARED" -lt "$EXPECTED_SHARED" ]; then
+            echo "ERROR: Not all shared_db collation ALTERs were applied!"
+            exit 1
+          fi
+          echo "shared_db collation validation PASSED."
+
+      - name: Validate collation changes on identity_db
+        run: |
+          EXPECTED_IDENTITY=31
+          ACTUAL_IDENTITY=$(mysql -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" -N -e "
+            SELECT COUNT(*)
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = '$WSO2_IDENTITY_DB'
+              AND COLLATION_NAME = 'utf8mb4_0900_ai_ci';
+          ")
+          echo "identity_db — expected: $EXPECTED_IDENTITY altered columns, actual: $ACTUAL_IDENTITY"
+          mysql -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" "$WSO2_IDENTITY_DB" -e "
+            SELECT TABLE_NAME, COLUMN_NAME, COLLATION_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = '$WSO2_IDENTITY_DB'
+              AND COLLATION_NAME = 'utf8mb4_0900_ai_ci'
+            ORDER BY TABLE_NAME, COLUMN_NAME;
+          "
+          if [ "$ACTUAL_IDENTITY" -lt "$EXPECTED_IDENTITY" ]; then
+            echo "ERROR: Not all identity_db collation ALTERs were applied!"
+            exit 1
+          fi
+          echo "identity_db collation validation PASSED."
+
+      # ── IS configuration ──────────────────────────────────────────────────────
+
+      - name: Add MySQL JDBC driver to IS distribution
+        run: |
+          mvn dependency:get -q -Dartifact=com.mysql:mysql-connector-j:$MYSQL_JDBC_VERSION
+          JDBC_JAR="$HOME/.m2/repository/com/mysql/mysql-connector-j/$MYSQL_JDBC_VERSION/mysql-connector-j-$MYSQL_JDBC_VERSION.jar"
+          cp "$JDBC_JAR" "$IS_DIST/repository/components/lib/"
+          echo "MySQL JDBC driver added."
+
+      - name: Configure deployment.toml for MySQL
+        run: |
+          DEPLOYMENT_TOML="$IS_DIST/repository/conf/deployment.toml"
+          python3 << PYEOF
+          import re, os
+
+          mysql_root_password = "${DB_PASSWORD}"
+          ws_identity_db = "${WSO2_IDENTITY_DB}"
+          ws_shared_db = "${WSO2_SHARED_DB}"
+          ws_agent_db = "${WSO2_AGENT_IDENTITY_DB}"
+          deployment_toml = "${DEPLOYMENT_TOML}"
+
+          with open(deployment_toml, "r") as f:
+              content = f.read()
+
+          content = re.sub(
+              r'\[database\.identity_db\](\s*\n[^\[]+)',
+              f'[database.identity_db]\ntype = "mysql"\nurl = "jdbc:mysql://localhost:3306/{ws_identity_db}?autoReconnect=true"\nusername = "root"\npassword = "{mysql_root_password}"\n',
+              content
+          )
+          content = re.sub(
+              r'\[database\.shared_db\](\s*\n[^\[]+)',
+              f'[database.shared_db]\ntype = "mysql"\nurl = "jdbc:mysql://localhost:3306/{ws_shared_db}?autoReconnect=true"\nusername = "root"\npassword = "{mysql_root_password}"\n',
+              content
+          )
+          content = re.sub(
+              r'\[datasource\.AgentIdentity\](\s*\n[^\[]+)',
+              f'[datasource.AgentIdentity]\nid = "AgentIdentity"\nurl = "jdbc:mysql://localhost:3306/{ws_agent_db}?autoReconnect=true"\nusername = "root"\npassword = "{mysql_root_password}"\ndriver = "com.mysql.cj.jdbc.Driver"\n',
+              content
+          )
+
+          with open(deployment_toml, "w") as f:
+              f.write(content)
+
+          print("deployment.toml configured for MySQL successfully.")
+          PYEOF
+          grep -A4 '\[database\.identity_db\]' "$DEPLOYMENT_TOML"
+          grep -A4 '\[database\.shared_db\]' "$DEPLOYMENT_TOML"
+
+      - name: Export MySQL database env vars
+        run: |
+          echo "IDENTITY_DATABASE_DRIVER=com.mysql.cj.jdbc.Driver" >> $GITHUB_ENV
+          echo "IDENTITY_DATABASE_URL=jdbc:mysql://localhost:3306/${WSO2_IDENTITY_DB}?autoReconnect=true" >> $GITHUB_ENV
+          echo "IDENTITY_DATABASE_USERNAME=root" >> $GITHUB_ENV
+          echo "IDENTITY_DATABASE_PASSWORD=${DB_PASSWORD}" >> $GITHUB_ENV
+          echo "SHARED_DATABASE_DRIVER=com.mysql.cj.jdbc.Driver" >> $GITHUB_ENV
+          echo "SHARED_DATABASE_URL=jdbc:mysql://localhost:3306/${WSO2_SHARED_DB}?autoReconnect=true" >> $GITHUB_ENV
+          echo "SHARED_DATABASE_USERNAME=root" >> $GITHUB_ENV
+          echo "SHARED_DATABASE_PASSWORD=${DB_PASSWORD}" >> $GITHUB_ENV
+          echo "AGENTIDENTITY_DATABASE_DRIVER=com.mysql.cj.jdbc.Driver" >> $GITHUB_ENV
+          echo "AGENTIDENTITY_DATABASE_URL=jdbc:mysql://localhost:3306/${WSO2_AGENT_IDENTITY_DB}?autoReconnect=true" >> $GITHUB_ENV
+          echo "AGENTIDENTITY_DATABASE_USERNAME=root" >> $GITHUB_ENV
+          echo "AGENTIDENTITY_DATABASE_PASSWORD=${DB_PASSWORD}" >> $GITHUB_ENV
+
+      # ── Integration tests ─────────────────────────────────────────────────────
+
+      - name: Disable tests not in matrix
+        run: |
+          TESTNG_PATH="modules/integration/tests-integration/tests-backend/src/test/resources/testng.xml"
+          ENABLED_TESTS="${{ matrix.tests }}"
+          ALL_TESTS=(
+            "is-tests-default-configuration"
+            "is-test-rest-api"
+            "is-test-webhooks"
+            "is-tests-scim2"
+            "is-test-adaptive-authentication"
+            "is-test-adaptive-authentication-nashorn"
+            "is-test-adaptive-authentication-nashorn-with-restart"
+            "is-tests-default-configuration-ldap"
+            "is-tests-uuid-user-store"
+            "is-tests-federation"
+            "is-tests-federation-restart"
+            "is-tests-jdbc-userstore"
+            "is-tests-read-only-userstore"
+            "is-tests-oauth-jwt-token-gen-enabled"
+            "is-tests-email-username"
+            "is-tests-with-individual-configuration-changes"
+            "is-tests-saml-query-profile"
+            "is-tests-default-encryption"
+            "is-test-session-mgt"
+            "is-tests-password-update-api"
+          )
+          for test in "${ALL_TESTS[@]}"; do
+            if [[ ! ",$ENABLED_TESTS," == *",$test,"* ]]; then
+              echo "Disabling: $test"
+              sed -i "s/name=\"$test\"/& enabled=\"false\"/" "$TESTNG_PATH"
+            fi
+          done
+
+      - name: Run integration tests
+        id: integration_test_step
+        env:
+          JAVA_HOME: ${{ env.J21HOME }}
+        run: |
+          cd modules/integration/
+          mvn clean install --batch-mode | tee ../../mvn-integration-test.log
+
+          PR_BUILD_STATUS=$(cat ../../mvn-integration-test.log | grep "\[INFO\] BUILD" | grep -oE '[^ ]+$')
+          PR_TEST_RESULT=$(sed -n -e '/\[INFO\] Results:/,/\[INFO\] Tests run:/ p' ../../mvn-integration-test.log)
+
+          PR_BUILD_FINAL_RESULT=$(
+            echo "==========================================================="
+            echo "product-is MySQL Collation ALTER BUILD $PR_BUILD_STATUS"
+            echo "=========================================================="
+            echo ""
+            echo "$PR_TEST_RESULT"
+          )
+
+          PR_BUILD_RESULT_LOG_TEMP=$(echo "$PR_BUILD_FINAL_RESULT" | sed 's/$/%0A/')
+          echo "::warning::$(echo $PR_BUILD_RESULT_LOG_TEMP)"
+
+          ENABLED_TESTS="${{ matrix.tests }}"
+          if [[ "$ENABLED_TESTS" == *"is-test-adaptive-authentication-nashorn"* ]]; then
+            EXPECTED_BUILD_SUCCESS_COUNT="17"
+          else
+            EXPECTED_BUILD_SUCCESS_COUNT="1"
+          fi
+
+          PR_BUILD_SUCCESS_COUNT=$(grep -o -i "\[INFO\] BUILD SUCCESS" ../../mvn-integration-test.log | wc -l)
+          if [ "$PR_BUILD_SUCCESS_COUNT" != "$EXPECTED_BUILD_SUCCESS_COUNT" ]; then
+            echo "::error::MySQL Collation ALTER integration test build not successful. Check artifacts for logs."
+            exit 1
+          fi
+
+      - name: Archive mvn build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-collation-mvn-build-log-${{ matrix.runner_id }}
+          path: |
+            mvn-build.log
+            mvn-integration-test.log
+          if-no-files-found: warn
+
+      - name: Archive surefire reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-collation-surefire-report-${{ matrix.runner_id }}
+          path: modules/integration/**/surefire-reports
+          if-no-files-found: warn
+
+      - name: Archive heap dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-collation-heap-dump-${{ matrix.runner_id }}
+          path: "**/**.hprof"
+          if-no-files-found: ignore
