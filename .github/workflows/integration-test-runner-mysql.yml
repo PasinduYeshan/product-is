@@ -187,20 +187,27 @@ jobs:
           grep -A4 '\[database\.identity_db\]' "$DEPLOYMENT_TOML"
           grep -A4 '\[database\.shared_db\]' "$DEPLOYMENT_TOML"
 
-      - name: Export MySQL database env vars
+      - name: Replace $env{} placeholders in test artifact TOMLs
         run: |
-          echo "IDENTITY_DATABASE_DRIVER=com.mysql.cj.jdbc.Driver" >> $GITHUB_ENV
-          echo "IDENTITY_DATABASE_URL=jdbc:mysql://localhost:3306/${WSO2_IDENTITY_DB}?autoReconnect=true" >> $GITHUB_ENV
-          echo "IDENTITY_DATABASE_USERNAME=root" >> $GITHUB_ENV
-          echo "IDENTITY_DATABASE_PASSWORD=${DB_PASSWORD}" >> $GITHUB_ENV
-          echo "SHARED_DATABASE_DRIVER=com.mysql.cj.jdbc.Driver" >> $GITHUB_ENV
-          echo "SHARED_DATABASE_URL=jdbc:mysql://localhost:3306/${WSO2_SHARED_DB}?autoReconnect=true" >> $GITHUB_ENV
-          echo "SHARED_DATABASE_USERNAME=root" >> $GITHUB_ENV
-          echo "SHARED_DATABASE_PASSWORD=${DB_PASSWORD}" >> $GITHUB_ENV
-          echo "AGENTIDENTITY_DATABASE_DRIVER=com.mysql.cj.jdbc.Driver" >> $GITHUB_ENV
-          echo "AGENTIDENTITY_DATABASE_URL=jdbc:mysql://localhost:3306/${WSO2_AGENT_IDENTITY_DB}?autoReconnect=true" >> $GITHUB_ENV
-          echo "AGENTIDENTITY_DATABASE_USERNAME=root" >> $GITHUB_ENV
-          echo "AGENTIDENTITY_DATABASE_PASSWORD=${DB_PASSWORD}" >> $GITHUB_ENV
+          ARTIFACTS_DIR="modules/integration/tests-integration/tests-backend/src/test/resources/artifacts/IS"
+          IDENTITY_URL="jdbc:mysql://localhost:3306/${WSO2_IDENTITY_DB}?autoReconnect=true"
+          SHARED_URL="jdbc:mysql://localhost:3306/${WSO2_SHARED_DB}?autoReconnect=true"
+          AGENT_URL="jdbc:mysql://localhost:3306/${WSO2_AGENT_IDENTITY_DB}?autoReconnect=true"
+          find "$ARTIFACTS_DIR" -name "*.toml" -exec sed -i \
+            -e "s|\\\$env{IDENTITY_DATABASE_DRIVER}|com.mysql.cj.jdbc.Driver|g" \
+            -e "s|\\\$env{IDENTITY_DATABASE_URL}|${IDENTITY_URL}|g" \
+            -e "s|\\\$env{IDENTITY_DATABASE_USERNAME}|root|g" \
+            -e "s|\\\$env{IDENTITY_DATABASE_PASSWORD}|${DB_PASSWORD}|g" \
+            -e "s|\\\$env{SHARED_DATABASE_DRIVER}|com.mysql.cj.jdbc.Driver|g" \
+            -e "s|\\\$env{SHARED_DATABASE_URL}|${SHARED_URL}|g" \
+            -e "s|\\\$env{SHARED_DATABASE_USERNAME}|root|g" \
+            -e "s|\\\$env{SHARED_DATABASE_PASSWORD}|${DB_PASSWORD}|g" \
+            -e "s|\\\$env{AGENTIDENTITY_DATABASE_DRIVER}|com.mysql.cj.jdbc.Driver|g" \
+            -e "s|\\\$env{AGENTIDENTITY_DATABASE_URL}|${AGENT_URL}|g" \
+            -e "s|\\\$env{AGENTIDENTITY_DATABASE_USERNAME}|root|g" \
+            -e "s|\\\$env{AGENTIDENTITY_DATABASE_PASSWORD}|${DB_PASSWORD}|g" \
+            {} +
+          echo "Replaced \$env{} placeholders in artifact TOMLs with MySQL values."
 
       - name: Disable tests not in matrix
         run: |
