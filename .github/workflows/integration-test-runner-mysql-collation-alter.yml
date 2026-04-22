@@ -378,6 +378,66 @@ jobs:
             exit 1
           fi
 
+      - name: Verify MySQL was used (not H2)
+        if: always()
+        run: |
+          echo "════════════════════════════════════════════════════════════════"
+          echo " MySQL vs H2 validation"
+          echo "════════════════════════════════════════════════════════════════"
+
+          echo ""
+          echo "── 1. MySQL row counts (non-zero proves tests wrote to MySQL) ──"
+          for tbl in SP_APP IDN_OAUTH_CONSUMER_APPS IDN_OAUTH2_ACCESS_TOKEN IDP IDN_AUTH_USER; do
+            count=$(mysql -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" -N -s \
+              -e "SELECT COUNT(*) FROM \`$tbl\`;" "$WSO2_IDENTITY_DB" 2>/dev/null || echo "ERR")
+            echo "  $WSO2_IDENTITY_DB.$tbl: $count"
+          done
+          for tbl in UM_USER UM_ROLE UM_TENANT; do
+            count=$(mysql -h 127.0.0.1 -P 3306 -u root -p"$DB_PASSWORD" -N -s \
+              -e "SELECT COUNT(*) FROM \`$tbl\`;" "$WSO2_SHARED_DB" 2>/dev/null || echo "ERR")
+            echo "  $WSO2_SHARED_DB.$tbl: $count"
+          done
+
+          echo ""
+          echo "── 2. Per-server deployment.toml DB config (federation spawns 3 servers) ──"
+          TEST_TARGET="modules/integration/tests-integration/tests-backend/target"
+          SERVER_DIRS=$(find "$TEST_TARGET" -type d -name "wso2is-*" 2>/dev/null || true)
+          if [ -z "$SERVER_DIRS" ]; then
+            echo "  WARN: no extracted server directories found under $TEST_TARGET"
+          else
+            for d in $SERVER_DIRS; do
+              toml="$d/repository/conf/deployment.toml"
+              if [ -f "$toml" ]; then
+                type_line=$(grep -E '^\s*type\s*=' "$toml" | head -1 || true)
+                echo "  $(basename $(dirname $(dirname "$d")))/$(basename "$d"): $type_line"
+              fi
+            done
+          fi
+
+          echo ""
+          echo "── 3. H2 fallback detection (any .mv.db file = FAIL) ──"
+          H2_FILES=$(find "$TEST_TARGET" -name "*.mv.db" 2>/dev/null || true)
+          if [ -n "$H2_FILES" ]; then
+            echo "::error::H2 database files detected — at least one server fell back to H2"
+            echo "$H2_FILES"
+            exit 1
+          else
+            echo "  OK: no H2 .mv.db files found"
+          fi
+
+          echo ""
+          echo "── 4. Server logs — MySQL driver references (all 3 servers) ──"
+          LOGS=$(find "$TEST_TARGET" -path "*/repository/logs/wso2carbon.log" 2>/dev/null || true)
+          if [ -z "$LOGS" ]; then
+            echo "  WARN: no wso2carbon.log files found"
+          else
+            for log in $LOGS; do
+              mysql_count=$(grep -cE "com\.mysql\.cj\.jdbc\.Driver|jdbc:mysql://" "$log" 2>/dev/null || echo 0)
+              h2_count=$(grep -cE "org\.h2\.Driver|jdbc:h2:" "$log" 2>/dev/null || echo 0)
+              echo "  $log → mysql refs: $mysql_count, h2 refs: $h2_count"
+            done
+          fi
+
       - name: Archive mvn build log
         if: always()
         uses: actions/upload-artifact@v4
